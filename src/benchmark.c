@@ -48,7 +48,6 @@ static float max_abs_diff(const float *a, const float *b, size_t count) {
 }
 
 static double benchmark_impl(sgemm_fn fn,
-                             const char *label,
                              float *C,
                              const float *A,
                              const float *B,
@@ -83,10 +82,45 @@ static double benchmark_impl(sgemm_fn fn,
         }
     }
 
-    double flops = 2.0 * (double)M * (double)N * (double)K;
-    double gflops = flops / best / 1e9;
-    printf("  %-12s %8.4f s  %8.3f GFLOP/s\n", label, best, gflops);
     return best;
+}
+
+static void benchmark_backend(const char *label,
+                              sgemm_fn fn,
+                              float *C_work,
+                              const float *C_seed,
+                              size_t elems,
+                              const float *A,
+                              const float *B,
+                              int size,
+                              int iterations,
+                              int repeats) {
+    if (!fn) {
+        return;
+    }
+    const size_t bytes = elems * sizeof(float);
+    double best = 1e9;
+    double total = 0.0;
+
+    for (int r = 0; r < repeats; ++r) {
+        memcpy(C_work, C_seed, bytes);
+        double t = benchmark_impl(fn, C_work, A, B, size, iterations);
+        if (t < best) {
+            best = t;
+        }
+        total += t;
+    }
+
+    double avg = total / repeats;
+    double flops = 2.0 * (double)size * (double)size * (double)size;
+    double best_gflops = flops / best / 1e9;
+    double avg_gflops = flops / avg / 1e9;
+    printf("  %-12s best %8.4f s  %8.3f GFLOP/s  avg %8.4f s  %8.3f GFLOP/s\n",
+           label,
+           best,
+           best_gflops,
+           avg,
+           avg_gflops);
 }
 
 static float *allocate_matrix(size_t elements) {
@@ -150,6 +184,7 @@ int main(void) {
 
     const int sizes[] = {512, 1024, 1536, 2048};
     const int iterations = 3;
+    const int repeats = 5;
 
     dyn_backend openblas = {
         .label = "OpenBLAS",
@@ -174,33 +209,59 @@ int main(void) {
 
         float *A = allocate_matrix(elems);
         float *B = allocate_matrix(elems);
+        float *C_seed = allocate_matrix(elems);
         float *C_simple = allocate_matrix(elems);
         float *C_blas = allocate_matrix(elems);
 
-        if (!A || !B || !C_simple || !C_blas) {
+        if (!A || !B || !C_seed || !C_simple || !C_blas) {
             fprintf(stderr, "Failed to allocate matrices for size %d\n", n);
             return EXIT_FAILURE;
         }
 
         fill_random(A, elems);
         fill_random(B, elems);
-        fill_random(C_simple, elems);
-        memcpy(C_blas, C_simple, elems * sizeof(float));
+        fill_random(C_seed, elems);
+        memcpy(C_simple, C_seed, elems * sizeof(float));
+        memcpy(C_blas, C_seed, elems * sizeof(float));
 
         printf("Size %4d x %4d:\n", n, n);
-        benchmark_impl(simple_cblas_sgemm, "simple", C_simple, A, B, n, iterations);
-        if (openblas.fn) {
-            benchmark_impl(openblas.fn, openblas.label, C_blas, A, B, n, iterations);
-        }
-        if (accelerate.fn) {
-            benchmark_impl(accelerate.fn, accelerate.label, C_blas, A, B, n, iterations);
-        }
+        benchmark_backend("simple",
+                          simple_cblas_sgemm,
+                          C_simple,
+                          C_seed,
+                          elems,
+                          A,
+                          B,
+                          n,
+                          iterations,
+                          repeats);
+        benchmark_backend(openblas.label,
+                          openblas.fn,
+                          C_blas,
+                          C_seed,
+                          elems,
+                          A,
+                          B,
+                          n,
+                          iterations,
+                          repeats);
+        benchmark_backend(accelerate.label,
+                          accelerate.fn,
+                          C_blas,
+                          C_seed,
+                          elems,
+                          A,
+                          B,
+                          n,
+                          iterations,
+                          repeats);
 
         float diff = max_abs_diff(C_simple, C_blas, elems);
         printf("  max |Δ| = %.6f\n\n", diff);
 
         free(A);
         free(B);
+        free(C_seed);
         free(C_simple);
         free(C_blas);
     }
