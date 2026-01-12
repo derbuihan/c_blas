@@ -78,6 +78,10 @@ static void reference_sgemm(bool row_major,
 }
 
 #if defined(__aarch64__)
+#include <arm_neon.h>
+#include <pthread.h>
+#include <unistd.h>
+
 void simple_blas_arm64_kernel_12x8(const float *A,
                                    const float *B,
                                    float *C,
@@ -91,7 +95,6 @@ void simple_blas_arm64_kernel_12x8(const float *A,
 #define SIMPLE_BLAS_ARM64_TILE_N 8
 
 // Cache blocking parameters (tuned for Apple Silicon / ARM64)
-// MC must be a multiple of TILE_M (12) to handle packing padding correctly without buffer overflow
 #define MC 264
 #define KC 256
 #define NC 512
@@ -99,13 +102,113 @@ void simple_blas_arm64_kernel_12x8(const float *A,
 static void pack_A(int M, int K, const float *A, int lda, float *buffer) {
     int i = 0;
     for (; i + SIMPLE_BLAS_ARM64_TILE_M <= M; i += SIMPLE_BLAS_ARM64_TILE_M) {
-        for (int p = 0; p < K; ++p) {
+        int p = 0;
+        for (; p + 3 < K; p += 4) {
+            const float *a_ptr0 = A + (size_t)(i + 0) * lda + p;
+            const float *a_ptr1 = A + (size_t)(i + 1) * lda + p;
+            const float *a_ptr2 = A + (size_t)(i + 2) * lda + p;
+            const float *a_ptr3 = A + (size_t)(i + 3) * lda + p;
+            const float *a_ptr4 = A + (size_t)(i + 4) * lda + p;
+            const float *a_ptr5 = A + (size_t)(i + 5) * lda + p;
+            const float *a_ptr6 = A + (size_t)(i + 6) * lda + p;
+            const float *a_ptr7 = A + (size_t)(i + 7) * lda + p;
+            const float *a_ptr8 = A + (size_t)(i + 8) * lda + p;
+            const float *a_ptr9 = A + (size_t)(i + 9) * lda + p;
+            const float *a_ptr10 = A + (size_t)(i + 10) * lda + p;
+            const float *a_ptr11 = A + (size_t)(i + 11) * lda + p;
+
+            float32x4_t r0 = vld1q_f32(a_ptr0);
+            float32x4_t r1 = vld1q_f32(a_ptr1);
+            float32x4_t r2 = vld1q_f32(a_ptr2);
+            float32x4_t r3 = vld1q_f32(a_ptr3);
+
+            float32x4_t r4 = vld1q_f32(a_ptr4);
+            float32x4_t r5 = vld1q_f32(a_ptr5);
+            float32x4_t r6 = vld1q_f32(a_ptr6);
+            float32x4_t r7 = vld1q_f32(a_ptr7);
+
+            float32x4_t r8 = vld1q_f32(a_ptr8);
+            float32x4_t r9 = vld1q_f32(a_ptr9);
+            float32x4_t r10 = vld1q_f32(a_ptr10);
+            float32x4_t r11 = vld1q_f32(a_ptr11);
+
+            float32x4x2_t t0, t1;
+            float64x2_t t0_0, t1_0, t0_1, t1_1;
+            float32x4_t c0_a, c1_a, c2_a, c3_a;
+            float32x4_t c0_b, c1_b, c2_b, c3_b;
+            float32x4_t c0_c, c1_c, c2_c, c3_c;
+
+            // Block A (rows 0-3)
+            t0 = vtrnq_f32(r0, r1);
+            t1 = vtrnq_f32(r2, r3);
+            t0_0 = vreinterpretq_f64_f32(t0.val[0]);
+            t1_0 = vreinterpretq_f64_f32(t1.val[0]);
+            t0_1 = vreinterpretq_f64_f32(t0.val[1]);
+            t1_1 = vreinterpretq_f64_f32(t1.val[1]);
+            c0_a = vreinterpretq_f32_f64(vzip1q_f64(t0_0, t1_0));
+            c2_a = vreinterpretq_f32_f64(vzip2q_f64(t0_0, t1_0));
+            c1_a = vreinterpretq_f32_f64(vzip1q_f64(t0_1, t1_1));
+            c3_a = vreinterpretq_f32_f64(vzip2q_f64(t0_1, t1_1));
+
+            // Block B (rows 4-7)
+            t0 = vtrnq_f32(r4, r5);
+            t1 = vtrnq_f32(r6, r7);
+            t0_0 = vreinterpretq_f64_f32(t0.val[0]);
+            t1_0 = vreinterpretq_f64_f32(t1.val[0]);
+            t0_1 = vreinterpretq_f64_f32(t0.val[1]);
+            t1_1 = vreinterpretq_f64_f32(t1.val[1]);
+            c0_b = vreinterpretq_f32_f64(vzip1q_f64(t0_0, t1_0));
+            c2_b = vreinterpretq_f32_f64(vzip2q_f64(t0_0, t1_0));
+            c1_b = vreinterpretq_f32_f64(vzip1q_f64(t0_1, t1_1));
+            c3_b = vreinterpretq_f32_f64(vzip2q_f64(t0_1, t1_1));
+
+            // Block C (rows 8-11)
+            t0 = vtrnq_f32(r8, r9);
+            t1 = vtrnq_f32(r10, r11);
+            t0_0 = vreinterpretq_f64_f32(t0.val[0]);
+            t1_0 = vreinterpretq_f64_f32(t1.val[0]);
+            t0_1 = vreinterpretq_f64_f32(t0.val[1]);
+            t1_1 = vreinterpretq_f64_f32(t1.val[1]);
+            c0_c = vreinterpretq_f32_f64(vzip1q_f64(t0_0, t1_0));
+            c2_c = vreinterpretq_f32_f64(vzip2q_f64(t0_0, t1_0));
+            c1_c = vreinterpretq_f32_f64(vzip1q_f64(t0_1, t1_1));
+            c3_c = vreinterpretq_f32_f64(vzip2q_f64(t0_1, t1_1));
+
+            // Store Column p
+            vst1q_f32(buffer + 0, c0_a);
+            vst1q_f32(buffer + 4, c0_b);
+            vst1q_f32(buffer + 8, c0_c);
+            buffer += 12;
+
+            // Store Column p+1
+            vst1q_f32(buffer + 0, c1_a);
+            vst1q_f32(buffer + 4, c1_b);
+            vst1q_f32(buffer + 8, c1_c);
+            buffer += 12;
+
+            // Store Column p+2
+            vst1q_f32(buffer + 0, c2_a);
+            vst1q_f32(buffer + 4, c2_b);
+            vst1q_f32(buffer + 8, c2_c);
+            buffer += 12;
+
+            // Store Column p+3
+            vst1q_f32(buffer + 0, c3_a);
+            vst1q_f32(buffer + 4, c3_b);
+            vst1q_f32(buffer + 8, c3_c);
+            buffer += 12;
+        }
+
+        // Cleanup K
+        for (; p < K; ++p) {
             const float *a_ptr = A + (size_t)i * lda + p;
             for (int k = 0; k < SIMPLE_BLAS_ARM64_TILE_M; ++k) {
                 *buffer++ = a_ptr[k * lda];
             }
         }
     }
+    
+    // Cleanup M (bottom edge)
     if (i < M) {
         for (int p = 0; p < K; ++p) {
             const float *a_ptr = A + (size_t)i * lda + p;
@@ -123,11 +226,14 @@ static void pack_A(int M, int K, const float *A, int lda, float *buffer) {
 static void pack_B(int K, int N, const float *B, int ldb, float *buffer) {
     int j = 0;
     for (; j + SIMPLE_BLAS_ARM64_TILE_N <= N; j += SIMPLE_BLAS_ARM64_TILE_N) {
-        for (int p = 0; p < K; ++p) {
+        int p = 0;
+        for (; p < K; ++p) {
             const float *b_ptr = B + (size_t)p * ldb + j;
-            for (int k = 0; k < SIMPLE_BLAS_ARM64_TILE_N; ++k) {
-                *buffer++ = b_ptr[k];
-            }
+            float32x4_t v0 = vld1q_f32(b_ptr);
+            float32x4_t v1 = vld1q_f32(b_ptr + 4);
+            vst1q_f32(buffer, v0);
+            vst1q_f32(buffer + 4, v1);
+            buffer += 8;
         }
     }
     if (j < N) {
@@ -273,6 +379,37 @@ static void arm64_row_major_sgemm(int M,
     free(packed_B);
 }
 
+#define MT_THRESHOLD_M 256
+#define MAX_THREADS 16
+
+typedef struct {
+    int M, N, K;
+    float alpha;
+    const float *A;
+    int lda;
+    const float *B;
+    int ldb;
+    float beta;
+    float *C;
+    int ldc;
+} ThreadArgs;
+
+static void *gemm_thread_worker(void *arg) {
+    ThreadArgs *args = (ThreadArgs *)arg;
+    arm64_row_major_sgemm(args->M,
+                          args->N,
+                          args->K,
+                          args->alpha,
+                          args->A,
+                          args->lda,
+                          args->B,
+                          args->ldb,
+                          args->beta,
+                          args->C,
+                          args->ldc);
+    return NULL;
+}
+
 static bool arm64_try_fast_path(bool row_major,
                                 bool trans_a,
                                 bool trans_b,
@@ -290,7 +427,55 @@ static bool arm64_try_fast_path(bool row_major,
     if (!row_major || trans_a || trans_b) {
         return false;
     }
-    arm64_row_major_sgemm(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
+
+    // Determine number of threads
+    long nprocs = sysconf(_SC_NPROCESSORS_ONLN);
+    if (nprocs < 1) nprocs = 1;
+    if (nprocs > MAX_THREADS) nprocs = MAX_THREADS;
+
+    int num_threads = (int)nprocs;
+    
+    // Fallback to single thread for small matrices or if only 1 core
+    if (M < MT_THRESHOLD_M || num_threads <= 1) {
+        arm64_row_major_sgemm(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
+        return true;
+    }
+
+    // Partition M across threads
+    pthread_t threads[MAX_THREADS];
+    ThreadArgs args[MAX_THREADS];
+
+    int rows_per_thread = M / num_threads;
+    int remainder = M % num_threads;
+    int current_row = 0;
+
+    for (int t = 0; t < num_threads; ++t) {
+        int rows = rows_per_thread + (t < remainder ? 1 : 0);
+        
+        args[t].M = rows;
+        args[t].N = N;
+        args[t].K = K;
+        args[t].alpha = alpha;
+        args[t].A = A + (size_t)current_row * lda;
+        args[t].lda = lda;
+        args[t].B = B;
+        args[t].ldb = ldb;
+        args[t].beta = beta;
+        args[t].C = C + (size_t)current_row * ldc;
+        args[t].ldc = ldc;
+
+        if (pthread_create(&threads[t], NULL, gemm_thread_worker, &args[t]) != 0) {
+            // If creation fails, fallback to processing this chunk in current thread (simplistic error handling)
+            gemm_thread_worker(&args[t]);
+        }
+        
+        current_row += rows;
+    }
+
+    for (int t = 0; t < num_threads; ++t) {
+        pthread_join(threads[t], NULL);
+    }
+
     return true;
 }
 #endif
