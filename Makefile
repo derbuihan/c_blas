@@ -1,13 +1,14 @@
 CC ?= cc
 CFLAGS ?= -O3 -std=c11 -Wall -Wextra -pedantic
-CPPFLAGS ?=
-LDFLAGS ?=
+CPPFLAGS ?= 
+LDFLAGS ?= 
 
 BUILD_DIR := build
 SRC_DIR := src
+TEST_DIR := tests
 
 ARCH := $(shell uname -m)
-ASM_SOURCES :=
+ASM_SOURCES := 
 ifeq ($(ARCH),arm64)
 ASM_SOURCES += $(SRC_DIR)/simple_blas_arm64_kernel.S
 endif
@@ -16,11 +17,18 @@ ASM_SOURCES += $(SRC_DIR)/simple_blas_arm64_kernel.S
 endif
 
 C_SOURCES := $(SRC_DIR)/simple_blas.c $(SRC_DIR)/benchmark.c
+TEST_SOURCES := $(TEST_DIR)/test_sgemm.c
+
 SOURCES := $(C_SOURCES) $(ASM_SOURCES)
 OBJECTS := $(addprefix $(BUILD_DIR)/,$(notdir $(C_SOURCES:.c=.o))) \
            $(addprefix $(BUILD_DIR)/,$(notdir $(ASM_SOURCES:.S=.o)))
 
-.PHONY: all clean run
+# Objects needed for testing (exclude benchmark.o)
+TEST_OBJECTS := $(BUILD_DIR)/simple_blas.o \
+                $(addprefix $(BUILD_DIR)/,$(notdir $(ASM_SOURCES:.S=.o))) \
+                $(BUILD_DIR)/test_sgemm.o
+
+.PHONY: all clean run test
 
 all: bench
 
@@ -33,11 +41,20 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.S | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
+$(BUILD_DIR)/%.o: $(TEST_DIR)/%.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
 bench: $(OBJECTS)
 	$(CC) $(OBJECTS) $(LDFLAGS) -o $@
 
 run: bench
 	./bench
 
+test_runner: $(TEST_OBJECTS)
+	$(CC) $(TEST_OBJECTS) $(LDFLAGS) -o $@
+
+test: test_runner
+	./test_runner
+
 clean:
-	rm -rf $(BUILD_DIR) bench
+	rm -rf $(BUILD_DIR) bench test_runner
