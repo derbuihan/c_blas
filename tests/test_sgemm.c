@@ -16,6 +16,7 @@ static void naive_sgemm(int M, int N, int K, float alpha, const float *A, int ld
             for (int p = 0; p < K; ++p) {
                 acc += A[i * lda + p] * B[p * ldb + j]; // Assumes RowMajor, NoTrans
             }
+
             if (beta == 0.0f) {
                 C[i * ldc + j] = alpha * acc;
             } else {

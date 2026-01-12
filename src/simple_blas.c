@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 static inline size_t row_major_index(int row, int col, int ld) {
     return (size_t)row * (size_t)ld + (size_t)col;
@@ -89,6 +90,60 @@ void simple_blas_arm64_kernel_12x8(const float *A,
 #define SIMPLE_BLAS_ARM64_TILE_M 12
 #define SIMPLE_BLAS_ARM64_TILE_N 8
 
+// Cache blocking parameters (tuned for Apple Silicon / ARM64)
+// MC must be a multiple of TILE_M (12) to handle packing padding correctly without buffer overflow
+#define MC 264
+#define KC 256
+#define NC 512
+
+static void pack_A(int M, int K, const float *A, int lda, float *buffer) {
+    int i = 0;
+    for (; i + SIMPLE_BLAS_ARM64_TILE_M <= M; i += SIMPLE_BLAS_ARM64_TILE_M) {
+        for (int p = 0; p < K; ++p) {
+            const float *a_ptr = A + (size_t)i * lda + p;
+            for (int k = 0; k < SIMPLE_BLAS_ARM64_TILE_M; ++k) {
+                *buffer++ = a_ptr[k * lda];
+            }
+        }
+    }
+    if (i < M) {
+        for (int p = 0; p < K; ++p) {
+            const float *a_ptr = A + (size_t)i * lda + p;
+            for (int k = 0; k < SIMPLE_BLAS_ARM64_TILE_M; ++k) {
+                if (i + k < M) {
+                    *buffer++ = a_ptr[k * lda];
+                } else {
+                    *buffer++ = 0.0f;
+                }
+            }
+        }
+    }
+}
+
+static void pack_B(int K, int N, const float *B, int ldb, float *buffer) {
+    int j = 0;
+    for (; j + SIMPLE_BLAS_ARM64_TILE_N <= N; j += SIMPLE_BLAS_ARM64_TILE_N) {
+        for (int p = 0; p < K; ++p) {
+            const float *b_ptr = B + (size_t)p * ldb + j;
+            for (int k = 0; k < SIMPLE_BLAS_ARM64_TILE_N; ++k) {
+                *buffer++ = b_ptr[k];
+            }
+        }
+    }
+    if (j < N) {
+        for (int p = 0; p < K; ++p) {
+            const float *b_ptr = B + (size_t)p * ldb + j;
+            for (int k = 0; k < SIMPLE_BLAS_ARM64_TILE_N; ++k) {
+                if (j + k < N) {
+                    *buffer++ = b_ptr[k];
+                } else {
+                    *buffer++ = 0.0f;
+                }
+            }
+        }
+    }
+}
+
 static void scalar_tail_block(int row_offset,
                               int col_offset,
                               int rows,
@@ -111,7 +166,8 @@ static void scalar_tail_block(int row_offset,
                 size_t b_idx = (size_t)p * ldb + (col_offset + jj);
                 acc += a_row[p] * B[b_idx];
             }
-            float value = alpha * acc;
+
+
             if (beta == 1.0f) {
                 value += c_row[jj];
             } else if (beta != 0.0f) {
@@ -133,75 +189,87 @@ static void arm64_row_major_sgemm(int M,
                                   float beta,
                                   float *C,
                                   int ldc) {
-    const int tile_m = SIMPLE_BLAS_ARM64_TILE_M;
-    const int tile_n = SIMPLE_BLAS_ARM64_TILE_N;
-
-    // Allocate a buffer for a packed panel of A.
-    // Each panel is tile_m x K.
-    float *packed_a = (float *)malloc((size_t)tile_m * (size_t)K * sizeof(float));
-    if (!packed_a) {
-        // Fallback to reference if allocation fails.
+    // Buffers for packing.
+    // MC must be aligned.
+    size_t size_A = (size_t)MC * (size_t)KC * sizeof(float);
+    size_t size_B = (size_t)KC * (size_t)NC * sizeof(float);
+    
+    float *packed_A = malloc(size_A);
+    float *packed_B = malloc(size_B);
+    
+    if (!packed_A || !packed_B) {
+        free(packed_A);
+        free(packed_B);
         reference_sgemm(true, false, false, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
         return;
     }
 
-    int i = 0;
-    for (; i + tile_m <= M; i += tile_m) {
-        // Pack A panel: transform from (tile_m x K) row-major to (K x tile_m) contiguous.
-        for (int p = 0; p < K; ++p) {
-            for (int ii = 0; ii < tile_m; ++ii) {
-                packed_a[p * tile_m + ii] = A[(size_t)(i + ii) * lda + p];
-            }
-        }
+    for (int j = 0; j < N; j += NC) {
+        int jb = N - j;
+        if (jb > NC) jb = NC;
+        
+        for (int p = 0; p < K; p += KC) {
+            int pb = K - p;
+            if (pb > KC) pb = KC;
+            
+            // Pack B: sub-panel B[p..p+pb][j..j+jb]
+            pack_B(pb, jb, B + (size_t)p * ldb + j, ldb, packed_B);
 
-        int j = 0;
-        for (; j + tile_n <= N; j += tile_n) {
-            const float *b_block = B + j;
-            float *c_block = C + (size_t)i * ldc + j;
-            simple_blas_arm64_kernel_12x8(packed_a,
-                                          b_block,
-                                          c_block,
-                                          tile_m, // here lda is actually tile_m for packed A
-                                          ldb,
-                                          ldc,
-                                          K,
-                                          alpha,
-                                          beta);
-        }
-        if (j < N) {
-            scalar_tail_block(i,
-                              j,
-                              tile_m,
-                              N - j,
-                              K,
-                              alpha,
-                              A,
-                              lda,
-                              B,
-                              ldb,
-                              beta,
-                              C,
-                              ldc);
+            for (int i = 0; i < M; i += MC) {
+                int ib = M - i;
+                if (ib > MC) ib = MC;
+                
+                // Pack A: sub-panel A[i..i+ib][p..p+pb]
+                pack_A(ib, pb, A + (size_t)i * lda + p, lda, packed_A);
+                
+                for (int jr = 0; jr < jb; jr += SIMPLE_BLAS_ARM64_TILE_N) {
+                    for (int ir = 0; ir < ib; ir += SIMPLE_BLAS_ARM64_TILE_M) {
+                        
+                        const float *ptr_a = packed_A + (size_t)ir * pb;
+                        const float *ptr_b = packed_B + (size_t)jr * pb;
+                        float *ptr_c = C + (size_t)(i + ir) * ldc + (j + jr);
+                        
+                        if (ir + SIMPLE_BLAS_ARM64_TILE_M <= ib && jr + SIMPLE_BLAS_ARM64_TILE_N <= jb) {
+                            float current_beta = (p == 0) ? beta : 1.0f;
+                            simple_blas_arm64_kernel_12x8(ptr_a,
+                                                          ptr_b,
+                                                          ptr_c,
+                                                          0,
+                                                          SIMPLE_BLAS_ARM64_TILE_N,
+                                                          ldc,
+                                                          pb,
+                                                          alpha,
+                                                          current_beta);
+                        } else {
+                            float current_beta = (p == 0) ? beta : 1.0f;
+                            int m_edge = (ib - ir);
+                            if (m_edge > SIMPLE_BLAS_ARM64_TILE_M) m_edge = SIMPLE_BLAS_ARM64_TILE_M;
+                            
+                            int n_edge = (jb - jr);
+                            if (n_edge > SIMPLE_BLAS_ARM64_TILE_N) n_edge = SIMPLE_BLAS_ARM64_TILE_N;
+                            
+                            scalar_tail_block(i + ir,
+                                              j + jr,
+                                              m_edge,
+                                              n_edge,
+                                              pb,
+                                              alpha,
+                                              A + (size_t)p, 
+                                              lda,
+                                              B + (size_t)p * ldb, 
+                                              ldb,
+                                              current_beta,
+                                              C,
+                                              ldc);
+                        }
+                    }
+                }
+            }
         }
     }
     
-    free(packed_a);
-
-    if (i < M) {
-        scalar_tail_block(i,
-                          0,
-                          M - i,
-                          N,
-                          K,
-                          alpha,
-                          A,
-                          lda,
-                          B,
-                          ldb,
-                          beta,
-                          C,
-                          ldc);
-    }
+    free(packed_A);
+    free(packed_B);
 }
 
 static bool arm64_try_fast_path(bool row_major,
