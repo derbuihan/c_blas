@@ -107,13 +107,8 @@ void simple_blas_arm64_pack_B_8xK(int K, const float *B, int ldb, float *buffer)
 static void pack_A(int M, int K, const float *A, int lda, float *buffer) {
     int i = 0;
     for (; i + SIMPLE_BLAS_ARM64_TILE_M <= M; i += SIMPLE_BLAS_ARM64_TILE_M) {
-        // Fast path: use ASM to pack 12 rows x K columns (multiples of 4)
         int k_packed = simple_blas_arm64_pack_A_12x4(K, A + (size_t)i * lda, lda, buffer);
-        
-        // Advance buffer by the amount processed (12 rows * k_packed floats)
         buffer += 12 * k_packed;
-
-        // Cleanup K (if K is not multiple of 4)
         for (int p = k_packed; p < K; ++p) {
             const float *a_ptr = A + (size_t)i * lda + p;
             for (int k = 0; k < SIMPLE_BLAS_ARM64_TILE_M; ++k) {
@@ -121,8 +116,6 @@ static void pack_A(int M, int K, const float *A, int lda, float *buffer) {
             }
         }
     }
-    
-    // Cleanup M (bottom edge)
     if (i < M) {
         for (int p = 0; p < K; ++p) {
             const float *a_ptr = A + (size_t)i * lda + p;
@@ -140,12 +133,9 @@ static void pack_A(int M, int K, const float *A, int lda, float *buffer) {
 static void pack_B(int K, int N, const float *B, int ldb, float *buffer) {
     int j = 0;
     for (; j + SIMPLE_BLAS_ARM64_TILE_N <= N; j += SIMPLE_BLAS_ARM64_TILE_N) {
-        // Fast path: pack K rows for 8 columns
         simple_blas_arm64_pack_B_8xK(K, B + j, ldb, buffer);
         buffer += K * 8;
     }
-    
-    // Cleanup N (right edge)
     if (j < N) {
         for (int p = 0; p < K; ++p) {
             const float *b_ptr = B + (size_t)p * ldb + j;
@@ -206,87 +196,40 @@ static void arm64_row_major_sgemm(int M,
                                   float beta,
                                   float *C,
                                   int ldc) {
-    // Buffers for packing.
-    // MC must be aligned.
     size_t size_A = (size_t)MC * (size_t)KC * sizeof(float);
     size_t size_B = (size_t)KC * (size_t)NC * sizeof(float);
-    
     float *packed_A = malloc(size_A);
     float *packed_B = malloc(size_B);
-    
     if (!packed_A || !packed_B) {
-        free(packed_A);
-        free(packed_B);
+        free(packed_A); free(packed_B);
         reference_sgemm(true, false, false, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
         return;
     }
-
     for (int j = 0; j < N; j += NC) {
-        int jb = N - j;
-        if (jb > NC) jb = NC;
-        
+        int jb = (N - j > NC) ? NC : N - j;
         for (int p = 0; p < K; p += KC) {
-            int pb = K - p;
-            if (pb > KC) pb = KC;
-            
-            // Pack B: sub-panel B[p..p+pb][j..j+jb]
+            int pb = (K - p > KC) ? KC : K - p;
             pack_B(pb, jb, B + (size_t)p * ldb + j, ldb, packed_B);
-
             for (int i = 0; i < M; i += MC) {
-                int ib = M - i;
-                if (ib > MC) ib = MC;
-                
-                // Pack A: sub-panel A[i..i+ib][p..p+pb]
+                int ib = (M - i > MC) ? MC : M - i;
                 pack_A(ib, pb, A + (size_t)i * lda + p, lda, packed_A);
-                
                 for (int jr = 0; jr < jb; jr += SIMPLE_BLAS_ARM64_TILE_N) {
                     for (int ir = 0; ir < ib; ir += SIMPLE_BLAS_ARM64_TILE_M) {
-                        
-                        const float *ptr_a = packed_A + (size_t)ir * pb;
-                        const float *ptr_b = packed_B + (size_t)jr * pb;
                         float *ptr_c = C + (size_t)(i + ir) * ldc + (j + jr);
-                        
+                        float current_beta = (p == 0) ? beta : 1.0f;
                         if (ir + SIMPLE_BLAS_ARM64_TILE_M <= ib && jr + SIMPLE_BLAS_ARM64_TILE_N <= jb) {
-                            float current_beta = (p == 0) ? beta : 1.0f;
-                            simple_blas_arm64_kernel_12x8(ptr_a,
-                                                          ptr_b,
-                                                          ptr_c,
-                                                          0,
-                                                          SIMPLE_BLAS_ARM64_TILE_N,
-                                                          ldc,
-                                                          pb,
-                                                          alpha,
-                                                          current_beta);
+                            simple_blas_arm64_kernel_12x8(packed_A + (size_t)ir * pb, packed_B + (size_t)jr * pb, ptr_c, 0, 8, ldc, pb, alpha, current_beta);
                         } else {
-                            float current_beta = (p == 0) ? beta : 1.0f;
-                            int m_edge = (ib - ir);
-                            if (m_edge > SIMPLE_BLAS_ARM64_TILE_M) m_edge = SIMPLE_BLAS_ARM64_TILE_M;
-                            
-                            int n_edge = (jb - jr);
-                            if (n_edge > SIMPLE_BLAS_ARM64_TILE_N) n_edge = SIMPLE_BLAS_ARM64_TILE_N;
-                            
-                            scalar_tail_block(i + ir,
-                                              j + jr,
-                                              m_edge,
-                                              n_edge,
-                                              pb,
-                                              alpha,
-                                              A + (size_t)p, 
-                                              lda,
-                                              B + (size_t)p * ldb, 
-                                              ldb,
-                                              current_beta,
-                                              C,
-                                              ldc);
+                            int me = (ib - ir > 12) ? 12 : ib - ir;
+                            int ne = (jb - jr > 8) ? 8 : jb - jr;
+                            scalar_tail_block(i + ir, j + jr, me, ne, pb, alpha, A + (size_t)p, lda, B + (size_t)p * ldb, ldb, current_beta, C, ldc);
                         }
                     }
                 }
             }
         }
     }
-    
-    free(packed_A);
-    free(packed_B);
+    free(packed_A); free(packed_B);
 }
 
 #define MT_THRESHOLD_M 256
@@ -294,183 +237,52 @@ static void arm64_row_major_sgemm(int M,
 
 typedef struct {
     int M, N, K;
-    float alpha;
-    const float *A;
-    int lda;
-    const float *B;
-    int ldb;
-    float beta;
+    float alpha, beta;
+    const float *A, *B;
+    int lda, ldb, ldc;
     float *C;
-    int ldc;
 } ThreadArgs;
 
 static void *gemm_thread_worker(void *arg) {
-    ThreadArgs *args = (ThreadArgs *)arg;
-    arm64_row_major_sgemm(args->M,
-                          args->N,
-                          args->K,
-                          args->alpha,
-                          args->A,
-                          args->lda,
-                          args->B,
-                          args->ldb,
-                          args->beta,
-                          args->C,
-                          args->ldc);
+    ThreadArgs *a = (ThreadArgs *)arg;
+    arm64_row_major_sgemm(a->M, a->N, a->K, a->alpha, a->A, a->lda, a->B, a->ldb, a->beta, a->C, a->ldc);
     return NULL;
 }
 
-static bool arm64_try_fast_path(bool row_major,
-                                bool trans_a,
-                                bool trans_b,
-                                int M,
-                                int N,
-                                int K,
-                                float alpha,
-                                const float *A,
-                                int lda,
-                                const float *B,
-                                int ldb,
-                                float beta,
-                                float *C,
-                                int ldc) {
-    if (!row_major || trans_a || trans_b) {
-        return false;
-    }
-
-    // Determine number of threads
+static bool arm64_try_fast_path(bool rm, bool ta, bool tb, int M, int N, int K, float alpha, const float *A, int lda, const float *B, int ldb, float beta, float *C, int ldc) {
+    if (!rm || ta || tb) return false;
     long nprocs = sysconf(_SC_NPROCESSORS_ONLN);
-    if (nprocs < 1) nprocs = 1;
-    if (nprocs > MAX_THREADS) nprocs = MAX_THREADS;
-
-    int num_threads = (int)nprocs;
-    
-    // Fallback to single thread for small matrices or if only 1 core
-    if (M < MT_THRESHOLD_M || num_threads <= 1) {
+    if (nprocs < 1) nprocs = 1; if (nprocs > MAX_THREADS) nprocs = MAX_THREADS;
+    int nt = (int)nprocs;
+    if (M < MT_THRESHOLD_M || nt <= 1) {
         arm64_row_major_sgemm(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
         return true;
     }
-
-    // Partition M across threads
-    pthread_t threads[MAX_THREADS];
-    ThreadArgs args[MAX_THREADS];
-
-    int rows_per_thread = M / num_threads;
-    int remainder = M % num_threads;
-    int current_row = 0;
-
-    for (int t = 0; t < num_threads; ++t) {
-        int rows = rows_per_thread + (t < remainder ? 1 : 0);
-        
-        args[t].M = rows;
-        args[t].N = N;
-        args[t].K = K;
-        args[t].alpha = alpha;
-        args[t].A = A + (size_t)current_row * lda;
-        args[t].lda = lda;
-        args[t].B = B;
-        args[t].ldb = ldb;
-        args[t].beta = beta;
-        args[t].C = C + (size_t)current_row * ldc;
-        args[t].ldc = ldc;
-
-        if (pthread_create(&threads[t], NULL, gemm_thread_worker, &args[t]) != 0) {
-            // If creation fails, fallback to processing this chunk in current thread (simplistic error handling)
-            gemm_thread_worker(&args[t]);
-        }
-        
-        current_row += rows;
+    pthread_t t[MAX_THREADS]; ThreadArgs args[MAX_THREADS];
+    int rpt = M / nt, rem = M % nt, cur = 0;
+    for (int i = 0; i < nt; i++) {
+        int rows = rpt + (i < rem ? 1 : 0);
+        args[i] = (ThreadArgs){rows, N, K, alpha, beta, A + (size_t)cur * lda, B, lda, ldb, ldc, C + (size_t)cur * ldc};
+        pthread_create(&t[i], NULL, gemm_thread_worker, &args[i]);
+        cur += rows;
     }
-
-    for (int t = 0; t < num_threads; ++t) {
-        pthread_join(threads[t], NULL);
-    }
-
+    for (int i = 0; i < nt; i++) pthread_join(t[i], NULL);
     return true;
 }
 #endif
 
-void simple_cblas_sgemm(enum CBLAS_ORDER Order,
-                        enum CBLAS_TRANSPOSE TransA,
-                        enum CBLAS_TRANSPOSE TransB,
-                        int M,
-                        int N,
-                        int K,
-                        float alpha,
-                        const float *A,
-                        int lda,
-                        const float *B,
-                        int ldb,
-                        float beta,
-                        float *C,
-                        int ldc) {
-    const bool row_major = (Order == CblasRowMajor);
-    const bool trans_a = (TransA == CblasTrans || TransA == CblasConjTrans);
-    const bool trans_b = (TransB == CblasTrans || TransB == CblasConjTrans);
-
-    if (M <= 0 || N <= 0 || K <= 0) {
-        return;
-    }
-
-    if (alpha == 0.0f) {
-        if (beta == 0.0f) {
-            zero_matrix(M, N, C, ldc, row_major);
-        } else if (beta != 1.0f) {
-            scale_matrix(M, N, C, ldc, beta, row_major);
-        }
-        return;
-    }
-
+void simple_cblas_sgemm(enum CBLAS_ORDER Order, enum CBLAS_TRANSPOSE TransA, enum CBLAS_TRANSPOSE TransB, int M, int N, int K, float alpha, const float *A, int lda, const float *B, int ldb, float beta, float *C, int ldc) {
+    bool rm = (Order == CblasRowMajor), ta = (TransA == CblasTrans || TransA == CblasConjTrans), tb = (TransB == CblasTrans || TransB == CblasConjTrans);
+    if (M <= 0 || N <= 0 || K <= 0) return;
+    if (alpha == 0.0f) { if (beta == 0.0f) zero_matrix(M, N, C, ldc, rm); else if (beta != 1.0f) scale_matrix(M, N, C, ldc, beta, rm); return; }
 #if defined(__aarch64__)
-    if (arm64_try_fast_path(row_major,
-                            trans_a,
-                            trans_b,
-                            M,
-                            N,
-                            K,
-                            alpha,
-                            A,
-                            lda,
-                            B,
-                            ldb,
-                            beta,
-                            C,
-                            ldc)) {
-        return;
-    }
+    if (arm64_try_fast_path(rm, ta, tb, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc)) return;
 #endif
-
-    reference_sgemm(row_major,
-                    trans_a,
-                    trans_b,
-                    M,
-                    N,
-                    K,
-                    alpha,
-                    A,
-                    lda,
-                    B,
-                    ldb,
-                    beta,
-                    C,
-                    ldc);
+    reference_sgemm(rm, ta, tb, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
 }
 
 #ifndef SIMPLE_BLAS_NO_ALIAS
-void cblas_sgemm(enum CBLAS_ORDER Order,
-                 enum CBLAS_TRANSPOSE TransA,
-                 enum CBLAS_TRANSPOSE TransB,
-                 int M,
-                 int N,
-                 int K,
-                 float alpha,
-                 const float *A,
-                 int lda,
-                 const float *B,
-                 int ldb,
-                 float beta,
-                 float *C,
-                 int ldc) {
+void cblas_sgemm(enum CBLAS_ORDER Order, enum CBLAS_TRANSPOSE TransA, enum CBLAS_TRANSPOSE TransB, int M, int N, int K, float alpha, const float *A, int lda, const float *B, int ldb, float beta, float *C, int ldc) {
     simple_cblas_sgemm(Order, TransA, TransB, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
 }
 #endif
