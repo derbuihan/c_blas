@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+#define _GNU_SOURCE
 #include "simple_blas.h"
 
 #include <assert.h>
@@ -47,42 +48,24 @@ static float max_abs_diff(const float *a, const float *b, size_t count) {
     return max_diff;
 }
 
-static double benchmark_impl(sgemm_fn fn,
-                             float *C,
-                             const float *A,
-                             const float *B,
-                             int size,
-                             int iterations) {
-    const int M = size;
-    const int N = size;
-    const int K = size;
-    const float alpha = 1.0f;
-    const float beta = 0.0f;
+static int compare_doubles(const void *a, const void *b) {
+    double da = *(const double *)a;
+    double db = *(const double *)b;
+    return (da > db) - (da < db);
+}
 
-    double best = 1e9;
-    for (int it = 0; it < iterations; ++it) {
-        double start = monotonic_seconds();
-        fn(CblasRowMajor,
-           CblasNoTrans,
-           CblasNoTrans,
-           M,
-           N,
-           K,
-           alpha,
-           A,
-           K,
-           B,
-           N,
-           beta,
-           C,
-           N);
-        double elapsed = monotonic_seconds() - start;
-        if (elapsed < best) {
-            best = elapsed;
-        }
+static void run_sgemm_batch(sgemm_fn fn, int n, int iterations, const float *A, const float *B, float *C, float beta) {
+    for (int i = 0; i < iterations; ++i) {
+        fn(CblasRowMajor, CblasNoTrans, CblasNoTrans, n, n, n, 1.0f, A, n, B, n, beta, C, n);
     }
+}
 
-    return best;
+static void print_backend_info(const char *label, sgemm_fn fn) {
+    if (!fn) return;
+    Dl_info info;
+    if (dladdr((void *)fn, &info) && info.dli_fname) {
+        printf("  [%s] symbol from: %s\n", label, info.dli_fname);
+    }
 }
 
 static void benchmark_backend(const char *label,
@@ -92,43 +75,61 @@ static void benchmark_backend(const char *label,
                               size_t elems,
                               const float *A,
                               const float *B,
-                              int size,
-                              int iterations,
-                              int repeats) {
-    if (!fn) {
-        return;
-    }
+                              int n) {
+    if (!fn) return;
+
+    const double target_bench_time = 0.2; 
+    const int outer_repeats = 5;         
     const size_t bytes = elems * sizeof(float);
-    double best = 1e9;
-    double total = 0.0;
-
-    for (int r = 0; r < repeats; ++r) {
-        memcpy(C_work, C_seed, bytes);
-        double t = benchmark_impl(fn, C_work, A, B, size, iterations);
-        if (t < best) {
-            best = t;
-        }
-        total += t;
+    const float beta = 1.0f; // Force reading C
+    
+    // Warm up & Estimate iterations
+    run_sgemm_batch(fn, n, 1, A, B, C_work, beta); 
+    
+    double start_est = monotonic_seconds();
+    run_sgemm_batch(fn, n, 1, A, B, C_work, beta);
+    double single_run = monotonic_seconds() - start_est;
+    
+    int iterations = 1;
+    if (single_run < target_bench_time) {
+        iterations = (int)(target_bench_time / (single_run + 1e-9));
+        if (iterations < 1) iterations = 1;
+        if (iterations > 1000000) iterations = 1000000;
     }
 
-    double avg = total / repeats;
-    double flops = 2.0 * (double)size * (double)size * (double)size;
-    double best_gflops = flops / best / 1e9;
-    double avg_gflops = flops / avg / 1e9;
-    printf("  %-12s best %8.4f s  %8.3f GFLOP/s  avg %8.4f s  %8.3f GFLOP/s\n",
-           label,
-           best,
-           best_gflops,
-           avg,
-           avg_gflops);
+    double results[outer_repeats];
+    double total_elapsed_sum = 0;
+    
+    // To prevent compiler from optimizing away the whole loop
+    volatile float sink = 0.0f;
+
+    for (int r = 0; r < outer_repeats; ++r) {
+        memcpy(C_work, C_seed, bytes);
+        
+        double start = monotonic_seconds();
+        run_sgemm_batch(fn, n, iterations, A, B, C_work, beta);
+        double elapsed = monotonic_seconds() - start;
+        
+        results[r] = elapsed / iterations;
+        total_elapsed_sum += elapsed;
+        
+        // Force a read from the result matrix
+        sink += C_work[rand() % elems];
+    }
+
+    qsort(results, outer_repeats, sizeof(double), compare_doubles);
+    
+    double median_time = results[outer_repeats / 2];
+    double flops_per_gemm = 2.0 * pow(n, 3);
+    double median_gflops = (flops_per_gemm / median_time) / 1e9;
+
+    printf("  %-12s | Median: %10.6f s (%8.2f GFLOP/s) | Total: %4.2fs | Iters: %-7d\n",
+           label, median_time, median_gflops, total_elapsed_sum, iterations);
 }
 
 static float *allocate_matrix(size_t elements) {
     float *ptr = NULL;
-    int rc = posix_memalign((void **)&ptr, 64, elements * sizeof(float));
-    if (rc != 0) {
-        return NULL;
-    }
+    if (posix_memalign((void **)&ptr, 64, elements * sizeof(float)) != 0) return NULL;
     return ptr;
 }
 
@@ -141,29 +142,16 @@ typedef struct {
 } dyn_backend;
 
 static int load_backend(dyn_backend *backend) {
-    const char *path = NULL;
-    if (backend->env_var) {
-        path = getenv(backend->env_var);
-    }
-    if (!path || path[0] == '\0') {
-        path = backend->default_path;
-    }
+    const char *path = backend->env_var ? getenv(backend->env_var) : NULL;
+    if (!path || path[0] == '\0') path = backend->default_path;
+    
     backend->handle = dlopen(path, RTLD_LAZY | RTLD_LOCAL);
     if (!backend->handle) {
-        fprintf(stderr,
-                "Skipping %s: failed to load %s (%s)\n",
-                backend->label,
-                path,
-                dlerror());
         backend->fn = NULL;
         return -1;
     }
     backend->fn = (sgemm_fn)dlsym(backend->handle, "cblas_sgemm");
     if (!backend->fn) {
-        fprintf(stderr,
-                "Skipping %s: unable to find cblas_sgemm in %s\n",
-                backend->label,
-                path);
         dlclose(backend->handle);
         backend->handle = NULL;
         return -1;
@@ -171,109 +159,59 @@ static int load_backend(dyn_backend *backend) {
     return 0;
 }
 
-static void unload_backend(dyn_backend *backend) {
-    if (backend->handle) {
-        dlclose(backend->handle);
-        backend->handle = NULL;
-        backend->fn = NULL;
-    }
-}
-
 int main(void) {
     srand(0);
+    printf("SGEMM Benchmark (Target: 0.2s/sample, Beta=1.0, Median of 5)\n");
 
-    /* Increased iterations and repeats for more stable benchmarking. */
-    const int iterations = 10;
-    const int repeats = 5;
-
-    dyn_backend openblas = {
-        .label = "OpenBLAS",
-        .env_var = "OPENBLAS_DYLIB",
-        .default_path = "/opt/homebrew/opt/openblas/lib/libopenblas.dylib",
-        .handle = NULL,
-        .fn = NULL};
-
-    dyn_backend accelerate = {
-        .label = "Accelerate",
-        .env_var = "ACCELERATE_DYLIB",
-        .default_path = "/System/Library/Frameworks/Accelerate.framework/Accelerate",
-        .handle = NULL,
-        .fn = NULL};
+    dyn_backend openblas = {"OpenBLAS", "OPENBLAS_DYLIB", "/opt/homebrew/opt/openblas/lib/libopenblas.dylib", NULL, NULL};
+    dyn_backend accelerate = {"Accelerate", "ACCELERATE_DYLIB", "/System/Library/Frameworks/Accelerate.framework/Accelerate", NULL, NULL};
 
     load_backend(&openblas);
     load_backend(&accelerate);
+
+    print_backend_info("OpenBLAS", openblas.fn);
+    print_backend_info("Accelerate", accelerate.fn);
 
     static const int sizes[] = {128, 256, 512, 1024, 2048};
 
     for (size_t idx = 0; idx < sizeof(sizes) / sizeof(sizes[0]); ++idx) {
         const int n = sizes[idx];
-        const size_t elems = (size_t)n * (size_t)n;
+        const size_t elems = (size_t)n * n;
 
         float *A = allocate_matrix(elems);
         float *B = allocate_matrix(elems);
         float *C_seed = allocate_matrix(elems);
         float *C_simple = allocate_matrix(elems);
-        float *C_blas = allocate_matrix(elems);
+        float *C_ref = allocate_matrix(elems);
 
-        if (!A || !B || !C_seed || !C_simple || !C_blas) {
-            fprintf(stderr, "Failed to allocate matrices for size %d\n", n);
-            return EXIT_FAILURE;
-        }
+        if (!A || !B || !C_seed || !C_simple || !C_ref) return EXIT_FAILURE;
 
         fill_random(A, elems);
         fill_random(B, elems);
         fill_random(C_seed, elems);
 
-        printf("Size %4d x %4d:\n", n, n);
+        printf("\nSize %4d x %4d:\n", n, n);
 
-        // Warm up for each backend to ensure stable clock/cache
-        simple_cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, n, n, n, 1.0f, A, n, B, n, 0.0f, C_simple, n);
-        if (openblas.fn) openblas.fn(CblasRowMajor, CblasNoTrans, CblasNoTrans, n, n, n, 1.0f, A, n, B, n, 0.0f, C_blas, n);
-        if (accelerate.fn) accelerate.fn(CblasRowMajor, CblasNoTrans, CblasNoTrans, n, n, n, 1.0f, A, n, B, n, 0.0f, C_blas, n);
+        sgemm_fn ref_fn = accelerate.fn ? accelerate.fn : (openblas.fn ? openblas.fn : NULL);
+        if (ref_fn) {
+            ref_fn(CblasRowMajor, CblasNoTrans, CblasNoTrans, n, n, n, 1.0f, A, n, B, n, 0.0f, C_ref, n);
+        }
 
-        benchmark_backend("simple",
-                          simple_cblas_sgemm,
-                          C_simple,
-                          C_seed,
-                          elems,
-                          A,
-                          B,
-                          n,
-                          iterations,
-                          repeats);
-        benchmark_backend(openblas.label,
-                          openblas.fn,
-                          C_blas,
-                          C_seed,
-                          elems,
-                          A,
-                          B,
-                          n,
-                          iterations,
-                          repeats);
-        benchmark_backend(accelerate.label,
-                          accelerate.fn,
-                          C_blas,
-                          C_seed,
-                          elems,
-                          A,
-                          B,
-                          n,
-                          iterations,
-                          repeats);
+        benchmark_backend("simple", simple_cblas_sgemm, C_simple, C_seed, elems, A, B, n);
+        benchmark_backend("OpenBLAS", openblas.fn, C_simple, C_seed, elems, A, B, n);
+        benchmark_backend("Accelerate", accelerate.fn, C_simple, C_seed, elems, A, B, n);
 
-        float diff = max_abs_diff(C_simple, C_blas, elems);
-        printf("  max |Δ| = %.6f\n\n", diff);
+        if (ref_fn) {
+            simple_cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, n, n, n, 1.0f, A, n, B, n, 0.0f, C_simple, n);
+            float diff = max_abs_diff(C_simple, C_ref, elems);
+            printf("  Verification max |Δ| = %.6e\n", diff);
+        }
 
-        free(A);
-        free(B);
-        free(C_seed);
-        free(C_simple);
-        free(C_blas);
+        free(A); free(B); free(C_seed); free(C_simple); free(C_ref);
     }
 
-    unload_backend(&openblas);
-    unload_backend(&accelerate);
+    if (openblas.handle) dlclose(openblas.handle);
+    if (accelerate.handle) dlclose(accelerate.handle);
 
     return EXIT_SUCCESS;
 }
