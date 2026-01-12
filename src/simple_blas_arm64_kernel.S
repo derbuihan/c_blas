@@ -233,3 +233,184 @@ FUNC(simple_blas_arm64_kernel_12x8):
 #if !defined(__APPLE__)
     .size FUNC(simple_blas_arm64_kernel_12x8), .-FUNC(simple_blas_arm64_kernel_12x8)
 #endif
+
+// -----------------------------------------------------------------------------
+// simple_blas_arm64_pack_A_12x4
+// Packs a 12xK block of A into a buffer for the kernel.
+// void simple_blas_arm64_pack_A_12x4(int K, const float *A, int lda, float *buffer);
+//
+// Accesses 12 rows of A.
+// 'K' is the number of columns to process. Function processes floor(K/4)*4 columns.
+// Returns the number of columns processed (multiple of 4).
+// -----------------------------------------------------------------------------
+    .p2align 2
+    .globl FUNC(simple_blas_arm64_pack_A_12x4)
+#if !defined(__APPLE__)
+    .type FUNC(simple_blas_arm64_pack_A_12x4), %function
+#endif
+FUNC(simple_blas_arm64_pack_A_12x4):
+    // x0: K, x1: A, x2: lda, x3: buffer
+    
+    // Check if K >= 4
+    lsr     w9, w0, #2      // Count = K / 4
+    cbz     w9, .Lpack_A_end_fast
+
+    // Save callee-saved registers x19-x26 (8 regs = 64 bytes)
+    stp     x19, x20, [sp, #-64]!
+    stp     x21, x22, [sp, #16]
+    stp     x23, x24, [sp, #32]
+    stp     x25, x26, [sp, #48]
+    
+    // Stride in bytes
+    sxtw    x2, w2
+    lsl     x2, x2, #2      // lda_bytes
+
+    // Setup pointers for 12 rows
+    // x4..x7: Rows 0..3 (volatile)
+    // x19..x26: Rows 4..11 (callee-saved)
+    
+    mov     x4, x1              // A0
+    add     x5, x4, x2          // A1
+    add     x6, x5, x2          // A2
+    add     x7, x6, x2          // A3
+    
+    add     x19, x7, x2         // A4
+    add     x20, x19, x2        // A5
+    add     x21, x20, x2        // A6
+    add     x22, x21, x2        // A7
+    
+    add     x23, x22, x2        // A8
+    add     x24, x23, x2        // A9
+    add     x25, x24, x2        // A10
+    add     x26, x25, x2        // A11
+    
+    // Main loop
+.Lpack_A_loop:
+    // Load 12 rows (4 floats each)
+    ldr     q0, [x4], #16       // A0
+    ldr     q1, [x5], #16       // A1
+    ldr     q2, [x6], #16       // A2
+    ldr     q3, [x7], #16       // A3
+    
+    ldr     q16, [x19], #16     // A4
+    ldr     q17, [x20], #16     // A5
+    ldr     q18, [x21], #16     // A6
+    ldr     q19, [x22], #16     // A7
+    
+    ldr     q20, [x23], #16     // A8
+    ldr     q21, [x24], #16     // A9
+    ldr     q22, [x25], #16     // A10
+    ldr     q23, [x26], #16     // A11
+    
+    // Transpose Block 0 (q0-q3) -> v0, v1, v2, v3
+    trn1    v4.4s, v0.4s, v1.4s  // 00 10 02 12
+    trn2    v5.4s, v0.4s, v1.4s  // 01 11 03 13
+    trn1    v6.4s, v2.4s, v3.4s  // 20 30 22 32
+    trn2    v7.4s, v2.4s, v3.4s  // 21 31 23 33
+    
+    trn1    v0.2d, v4.2d, v6.2d  // Col 0
+    trn2    v2.2d, v4.2d, v6.2d  // Col 2
+    trn1    v1.2d, v5.2d, v7.2d  // Col 1
+    trn2    v3.2d, v5.2d, v7.2d  // Col 3
+    
+    // Transpose Block 1 (q16-q19) -> v16, v17, v18, v19
+    trn1    v4.4s, v16.4s, v17.4s
+    trn2    v5.4s, v16.4s, v17.4s
+    trn1    v6.4s, v18.4s, v19.4s
+    trn2    v7.4s, v18.4s, v19.4s
+    
+    trn1    v16.2d, v4.2d, v6.2d
+    trn2    v18.2d, v4.2d, v6.2d
+    trn1    v17.2d, v5.2d, v7.2d
+    trn2    v19.2d, v5.2d, v7.2d
+    
+    // Transpose Block 2 (q20-q23) -> v20, v21, v22, v23
+    trn1    v4.4s, v20.4s, v21.4s
+    trn2    v5.4s, v20.4s, v21.4s
+    trn1    v6.4s, v22.4s, v23.4s
+    trn2    v7.4s, v22.4s, v23.4s
+    
+    trn1    v20.2d, v4.2d, v6.2d
+    trn2    v22.2d, v4.2d, v6.2d
+    trn1    v21.2d, v5.2d, v7.2d
+    trn2    v23.2d, v5.2d, v7.2d
+    
+    // Store Col 0
+    st1     {v0.4s}, [x3], #16   // Blk0
+    st1     {v16.4s}, [x3], #16  // Blk1
+    st1     {v20.4s}, [x3], #16  // Blk2
+    
+    // Store Col 1
+    st1     {v1.4s}, [x3], #16
+    st1     {v17.4s}, [x3], #16
+    st1     {v21.4s}, [x3], #16
+    
+    // Store Col 2
+    st1     {v2.4s}, [x3], #16
+    st1     {v18.4s}, [x3], #16
+    st1     {v22.4s}, [x3], #16
+    
+    // Store Col 3
+    st1     {v3.4s}, [x3], #16
+    st1     {v19.4s}, [x3], #16
+    st1     {v23.4s}, [x3], #16
+    
+    subs    w9, w9, #1
+    b.ne    .Lpack_A_loop
+
+    // Restore registers
+    ldp     x25, x26, [sp, #48]
+    ldp     x23, x24, [sp, #32]
+    ldp     x21, x22, [sp, #16]
+    ldp     x19, x20, [sp], #64
+
+.Lpack_A_end_fast:
+    // Return number of columns processed (K & ~3)
+    and     w0, w0, #0xfffffffc
+    ret
+
+#if !defined(__APPLE__)
+    .size FUNC(simple_blas_arm64_pack_A_12x4), .-FUNC(simple_blas_arm64_pack_A_12x4)
+#endif
+
+
+// -----------------------------------------------------------------------------
+// simple_blas_arm64_pack_B_8xK
+// Packs a Kx8 block of B into a buffer.
+// void simple_blas_arm64_pack_B_8xK(int K, const float *B, int ldb, float *buffer);
+//
+// Accesses K rows of B.
+// Packs 8 columns (assumed valid).
+// -----------------------------------------------------------------------------
+    .p2align 2
+    .globl FUNC(simple_blas_arm64_pack_B_8xK)
+#if !defined(__APPLE__)
+    .type FUNC(simple_blas_arm64_pack_B_8xK), %function
+#endif
+FUNC(simple_blas_arm64_pack_B_8xK):
+    // x0: K, x1: B, x2: ldb, x3: buffer
+    
+    cbz     w0, .Lpack_B_end
+    
+    // ldb in bytes
+    sxtw    x2, w2
+    lsl     x2, x2, #2
+    
+.Lpack_B_loop:
+    // Load B[p][0..3] and B[p][4..7]
+    ldr     q0, [x1]
+    ldr     q1, [x1, #16]
+    add     x1, x1, x2      // B += ldb
+    
+    // Store contiguous
+    stp     q0, q1, [x3], #32
+    
+    subs    w0, w0, #1
+    b.ne    .Lpack_B_loop
+
+.Lpack_B_end:
+    ret
+
+#if !defined(__APPLE__)
+    .size FUNC(simple_blas_arm64_pack_B_8xK), .-FUNC(simple_blas_arm64_pack_B_8xK)
+#endif

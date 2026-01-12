@@ -78,9 +78,9 @@ static void reference_sgemm(bool row_major,
 }
 
 #if defined(__aarch64__)
-#include <arm_neon.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <stdio.h>
 
 void simple_blas_arm64_kernel_12x8(const float *A,
                                    const float *B,
@@ -91,6 +91,11 @@ void simple_blas_arm64_kernel_12x8(const float *A,
                                    int K,
                                    float alpha,
                                    float beta);
+
+// ASM packing functions
+int simple_blas_arm64_pack_A_12x4(int K, const float *A, int lda, float *buffer);
+void simple_blas_arm64_pack_B_8xK(int K, const float *B, int ldb, float *buffer);
+
 #define SIMPLE_BLAS_ARM64_TILE_M 12
 #define SIMPLE_BLAS_ARM64_TILE_N 8
 
@@ -102,105 +107,14 @@ void simple_blas_arm64_kernel_12x8(const float *A,
 static void pack_A(int M, int K, const float *A, int lda, float *buffer) {
     int i = 0;
     for (; i + SIMPLE_BLAS_ARM64_TILE_M <= M; i += SIMPLE_BLAS_ARM64_TILE_M) {
-        int p = 0;
-        for (; p + 3 < K; p += 4) {
-            const float *a_ptr0 = A + (size_t)(i + 0) * lda + p;
-            const float *a_ptr1 = A + (size_t)(i + 1) * lda + p;
-            const float *a_ptr2 = A + (size_t)(i + 2) * lda + p;
-            const float *a_ptr3 = A + (size_t)(i + 3) * lda + p;
-            const float *a_ptr4 = A + (size_t)(i + 4) * lda + p;
-            const float *a_ptr5 = A + (size_t)(i + 5) * lda + p;
-            const float *a_ptr6 = A + (size_t)(i + 6) * lda + p;
-            const float *a_ptr7 = A + (size_t)(i + 7) * lda + p;
-            const float *a_ptr8 = A + (size_t)(i + 8) * lda + p;
-            const float *a_ptr9 = A + (size_t)(i + 9) * lda + p;
-            const float *a_ptr10 = A + (size_t)(i + 10) * lda + p;
-            const float *a_ptr11 = A + (size_t)(i + 11) * lda + p;
+        // Fast path: use ASM to pack 12 rows x K columns (multiples of 4)
+        int k_packed = simple_blas_arm64_pack_A_12x4(K, A + (size_t)i * lda, lda, buffer);
+        
+        // Advance buffer by the amount processed (12 rows * k_packed floats)
+        buffer += 12 * k_packed;
 
-            float32x4_t r0 = vld1q_f32(a_ptr0);
-            float32x4_t r1 = vld1q_f32(a_ptr1);
-            float32x4_t r2 = vld1q_f32(a_ptr2);
-            float32x4_t r3 = vld1q_f32(a_ptr3);
-
-            float32x4_t r4 = vld1q_f32(a_ptr4);
-            float32x4_t r5 = vld1q_f32(a_ptr5);
-            float32x4_t r6 = vld1q_f32(a_ptr6);
-            float32x4_t r7 = vld1q_f32(a_ptr7);
-
-            float32x4_t r8 = vld1q_f32(a_ptr8);
-            float32x4_t r9 = vld1q_f32(a_ptr9);
-            float32x4_t r10 = vld1q_f32(a_ptr10);
-            float32x4_t r11 = vld1q_f32(a_ptr11);
-
-            float32x4x2_t t0, t1;
-            float64x2_t t0_0, t1_0, t0_1, t1_1;
-            float32x4_t c0_a, c1_a, c2_a, c3_a;
-            float32x4_t c0_b, c1_b, c2_b, c3_b;
-            float32x4_t c0_c, c1_c, c2_c, c3_c;
-
-            // Block A (rows 0-3)
-            t0 = vtrnq_f32(r0, r1);
-            t1 = vtrnq_f32(r2, r3);
-            t0_0 = vreinterpretq_f64_f32(t0.val[0]);
-            t1_0 = vreinterpretq_f64_f32(t1.val[0]);
-            t0_1 = vreinterpretq_f64_f32(t0.val[1]);
-            t1_1 = vreinterpretq_f64_f32(t1.val[1]);
-            c0_a = vreinterpretq_f32_f64(vzip1q_f64(t0_0, t1_0));
-            c2_a = vreinterpretq_f32_f64(vzip2q_f64(t0_0, t1_0));
-            c1_a = vreinterpretq_f32_f64(vzip1q_f64(t0_1, t1_1));
-            c3_a = vreinterpretq_f32_f64(vzip2q_f64(t0_1, t1_1));
-
-            // Block B (rows 4-7)
-            t0 = vtrnq_f32(r4, r5);
-            t1 = vtrnq_f32(r6, r7);
-            t0_0 = vreinterpretq_f64_f32(t0.val[0]);
-            t1_0 = vreinterpretq_f64_f32(t1.val[0]);
-            t0_1 = vreinterpretq_f64_f32(t0.val[1]);
-            t1_1 = vreinterpretq_f64_f32(t1.val[1]);
-            c0_b = vreinterpretq_f32_f64(vzip1q_f64(t0_0, t1_0));
-            c2_b = vreinterpretq_f32_f64(vzip2q_f64(t0_0, t1_0));
-            c1_b = vreinterpretq_f32_f64(vzip1q_f64(t0_1, t1_1));
-            c3_b = vreinterpretq_f32_f64(vzip2q_f64(t0_1, t1_1));
-
-            // Block C (rows 8-11)
-            t0 = vtrnq_f32(r8, r9);
-            t1 = vtrnq_f32(r10, r11);
-            t0_0 = vreinterpretq_f64_f32(t0.val[0]);
-            t1_0 = vreinterpretq_f64_f32(t1.val[0]);
-            t0_1 = vreinterpretq_f64_f32(t0.val[1]);
-            t1_1 = vreinterpretq_f64_f32(t1.val[1]);
-            c0_c = vreinterpretq_f32_f64(vzip1q_f64(t0_0, t1_0));
-            c2_c = vreinterpretq_f32_f64(vzip2q_f64(t0_0, t1_0));
-            c1_c = vreinterpretq_f32_f64(vzip1q_f64(t0_1, t1_1));
-            c3_c = vreinterpretq_f32_f64(vzip2q_f64(t0_1, t1_1));
-
-            // Store Column p
-            vst1q_f32(buffer + 0, c0_a);
-            vst1q_f32(buffer + 4, c0_b);
-            vst1q_f32(buffer + 8, c0_c);
-            buffer += 12;
-
-            // Store Column p+1
-            vst1q_f32(buffer + 0, c1_a);
-            vst1q_f32(buffer + 4, c1_b);
-            vst1q_f32(buffer + 8, c1_c);
-            buffer += 12;
-
-            // Store Column p+2
-            vst1q_f32(buffer + 0, c2_a);
-            vst1q_f32(buffer + 4, c2_b);
-            vst1q_f32(buffer + 8, c2_c);
-            buffer += 12;
-
-            // Store Column p+3
-            vst1q_f32(buffer + 0, c3_a);
-            vst1q_f32(buffer + 4, c3_b);
-            vst1q_f32(buffer + 8, c3_c);
-            buffer += 12;
-        }
-
-        // Cleanup K
-        for (; p < K; ++p) {
+        // Cleanup K (if K is not multiple of 4)
+        for (int p = k_packed; p < K; ++p) {
             const float *a_ptr = A + (size_t)i * lda + p;
             for (int k = 0; k < SIMPLE_BLAS_ARM64_TILE_M; ++k) {
                 *buffer++ = a_ptr[k * lda];
@@ -226,16 +140,12 @@ static void pack_A(int M, int K, const float *A, int lda, float *buffer) {
 static void pack_B(int K, int N, const float *B, int ldb, float *buffer) {
     int j = 0;
     for (; j + SIMPLE_BLAS_ARM64_TILE_N <= N; j += SIMPLE_BLAS_ARM64_TILE_N) {
-        int p = 0;
-        for (; p < K; ++p) {
-            const float *b_ptr = B + (size_t)p * ldb + j;
-            float32x4_t v0 = vld1q_f32(b_ptr);
-            float32x4_t v1 = vld1q_f32(b_ptr + 4);
-            vst1q_f32(buffer, v0);
-            vst1q_f32(buffer + 4, v1);
-            buffer += 8;
-        }
+        // Fast path: pack K rows for 8 columns
+        simple_blas_arm64_pack_B_8xK(K, B + j, ldb, buffer);
+        buffer += K * 8;
     }
+    
+    // Cleanup N (right edge)
     if (j < N) {
         for (int p = 0; p < K; ++p) {
             const float *b_ptr = B + (size_t)p * ldb + j;

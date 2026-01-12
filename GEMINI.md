@@ -5,15 +5,16 @@
 
 **Key Features:**
 *   **Reference Implementation:** A clear, naive implementation for correctness verification.
-*   **ARM64 Optimization:** specialized kernels using NEON intrinsics, loop unrolling, and cache blocking (tiling) for Apple Silicon and other ARM64 targets.
+*   **ARM64 Optimization:** Specialized kernels and packing routines implemented in pure ARM64 assembly, utilizing NEON instructions, loop unrolling, and cache blocking (tiling) for maximum performance on Apple Silicon and other ARM64 targets.
+*   **Minimal C Dependencies:** Avoids `<arm_neon.h>` in C code to maintain a clean abstraction and leverage manual instruction scheduling in assembly.
 *   **CBLAS Compatibility:** Exposes an API compatible with the standard `cblas_sgemm` function, allowing it to work as a shim.
 *   **Zero Dependencies:** Designed to build without external BLAS libraries, though it can optionally alias standard CBLAS types if headers are present.
 
 ## Directory Structure
 *   `src/`: Core source code.
-    *   `simple_blas.c`: Main logic, including reference implementation and packing routines for the optimized kernels.
+    *   `simple_blas.c`: High-level logic, including reference implementation and cache-blocking (tiling) orchestration.
     *   `simple_blas.h`: Public API definitions and minimal CBLAS enum shims.
-    *   `simple_blas_arm64_kernel.S`: Assembly optimized kernel (linked if on ARM64).
+    *   `simple_blas_arm64_kernel.S`: Pure assembly implementation of computation kernels and performance-critical packing routines.
     *   `benchmark.c`: Benchmarking driver to measure GFLOP/s.
 *   `tests/`: Correctness tests.
     *   `test_sgemm.c`: Validates the implementation against a naive reference GEMM across various matrix sizes and edge cases.
@@ -48,8 +49,9 @@ The project uses a standard `Makefile`.
     *   Public API: `simple_cblas_` prefix.
     *   Macros: `SIMPLE_` prefix.
 *   **Optimization:**
-    *   Use `static inline` for helper functions to encourage inlining.
-    *   Guard architecture-specific code (like SIMD) with preprocessor checks (e.g., `#if defined(__aarch64__)`).
+    *   Use pure assembly (`.S` files) for performance-critical inner kernels and data-packing routines instead of C-based SIMD intrinsics. This allows for precise control over instruction scheduling and register allocation.
+    *   Use `static inline` for helper functions in C to encourage inlining.
+    *   Guard architecture-specific code with preprocessor checks (e.g., `#if defined(__aarch64__)`).
     *   Keep error paths lightweight.
 *   **Testing:**
     *   Always ensure `make test` passes before submitting changes.
