@@ -182,10 +182,9 @@ static void unload_backend(dyn_backend *backend) {
 int main(void) {
     srand(0);
 
-    /* Keep the suite fast enough for the reference scalar kernel. */
-    const int sizes[] = {256, 512, 768};
-    const int iterations = 1;
-    const int repeats = 2;
+    /* Increased iterations and repeats for more stable benchmarking. */
+    const int iterations = 10;
+    const int repeats = 5;
 
     dyn_backend openblas = {
         .label = "OpenBLAS",
@@ -203,6 +202,8 @@ int main(void) {
 
     load_backend(&openblas);
     load_backend(&accelerate);
+
+    static const int sizes[] = {128, 256, 512, 1024, 2048};
 
     for (size_t idx = 0; idx < sizeof(sizes) / sizeof(sizes[0]); ++idx) {
         const int n = sizes[idx];
@@ -222,10 +223,14 @@ int main(void) {
         fill_random(A, elems);
         fill_random(B, elems);
         fill_random(C_seed, elems);
-        memcpy(C_simple, C_seed, elems * sizeof(float));
-        memcpy(C_blas, C_seed, elems * sizeof(float));
 
         printf("Size %4d x %4d:\n", n, n);
+
+        // Warm up for each backend to ensure stable clock/cache
+        simple_cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, n, n, n, 1.0f, A, n, B, n, 0.0f, C_simple, n);
+        if (openblas.fn) openblas.fn(CblasRowMajor, CblasNoTrans, CblasNoTrans, n, n, n, 1.0f, A, n, B, n, 0.0f, C_blas, n);
+        if (accelerate.fn) accelerate.fn(CblasRowMajor, CblasNoTrans, CblasNoTrans, n, n, n, 1.0f, A, n, B, n, 0.0f, C_blas, n);
+
         benchmark_backend("simple",
                           simple_cblas_sgemm,
                           C_simple,
