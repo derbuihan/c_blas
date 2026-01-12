@@ -182,9 +182,10 @@ static void unload_backend(dyn_backend *backend) {
 int main(void) {
     srand(0);
 
-    const int sizes[] = {512, 1024, 1536, 2048};
-    const int iterations = 3;
-    const int repeats = 5;
+    /* Keep the suite fast enough for the reference scalar kernel. */
+    const int sizes[] = {256, 512, 768};
+    const int iterations = 1;
+    const int repeats = 2;
 
     dyn_backend openblas = {
         .label = "OpenBLAS",
