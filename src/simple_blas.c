@@ -2,6 +2,7 @@
 #include "simple_blas.h"
 
 #include <stdbool.h>
+#include <stdlib.h>
 
 static inline size_t row_major_index(int row, int col, int ld) {
     return (size_t)row * (size_t)ld + (size_t)col;
@@ -76,16 +77,17 @@ static void reference_sgemm(bool row_major,
 }
 
 #if defined(__aarch64__)
-void simple_blas_arm64_kernel_4x4(const float *A,
-                                  const float *B,
-                                  float *C,
-                                  int lda,
-                                  int ldb,
-                                  int ldc,
-                                  int K,
-                                  float alpha,
-                                  float beta);
-#define SIMPLE_BLAS_ARM64_TILE 4
+void simple_blas_arm64_kernel_12x8(const float *A,
+                                   const float *B,
+                                   float *C,
+                                   int lda,
+                                   int ldb,
+                                   int ldc,
+                                   int K,
+                                   float alpha,
+                                   float beta);
+#define SIMPLE_BLAS_ARM64_TILE_M 12
+#define SIMPLE_BLAS_ARM64_TILE_N 8
 
 static void scalar_tail_block(int row_offset,
                               int col_offset,
@@ -131,28 +133,45 @@ static void arm64_row_major_sgemm(int M,
                                   float beta,
                                   float *C,
                                   int ldc) {
-    const int tile = SIMPLE_BLAS_ARM64_TILE;
+    const int tile_m = SIMPLE_BLAS_ARM64_TILE_M;
+    const int tile_n = SIMPLE_BLAS_ARM64_TILE_N;
+
+    // Allocate a buffer for a packed panel of A.
+    // Each panel is tile_m x K.
+    float *packed_a = (float *)malloc((size_t)tile_m * (size_t)K * sizeof(float));
+    if (!packed_a) {
+        // Fallback to reference if allocation fails.
+        reference_sgemm(true, false, false, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
+        return;
+    }
+
     int i = 0;
-    for (; i + tile <= M; i += tile) {
+    for (; i + tile_m <= M; i += tile_m) {
+        // Pack A panel: transform from (tile_m x K) row-major to (K x tile_m) contiguous.
+        for (int p = 0; p < K; ++p) {
+            for (int ii = 0; ii < tile_m; ++ii) {
+                packed_a[p * tile_m + ii] = A[(size_t)(i + ii) * lda + p];
+            }
+        }
+
         int j = 0;
-        for (; j + tile <= N; j += tile) {
-            const float *a_block = A + (size_t)i * lda;
+        for (; j + tile_n <= N; j += tile_n) {
             const float *b_block = B + j;
             float *c_block = C + (size_t)i * ldc + j;
-            simple_blas_arm64_kernel_4x4(a_block,
-                                         b_block,
-                                         c_block,
-                                         lda,
-                                         ldb,
-                                         ldc,
-                                         K,
-                                         alpha,
-                                         beta);
+            simple_blas_arm64_kernel_12x8(packed_a,
+                                          b_block,
+                                          c_block,
+                                          tile_m, // here lda is actually tile_m for packed A
+                                          ldb,
+                                          ldc,
+                                          K,
+                                          alpha,
+                                          beta);
         }
         if (j < N) {
             scalar_tail_block(i,
                               j,
-                              tile,
+                              tile_m,
                               N - j,
                               K,
                               alpha,
@@ -165,6 +184,9 @@ static void arm64_row_major_sgemm(int M,
                               ldc);
         }
     }
+    
+    free(packed_a);
+
     if (i < M) {
         scalar_tail_block(i,
                           0,
