@@ -168,6 +168,7 @@ static void scalar_tail_block(int row_offset,
             }
 
 
+            float value = alpha * acc;
             if (beta == 1.0f) {
                 value += c_row[jj];
             } else if (beta != 0.0f) {
