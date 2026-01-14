@@ -100,9 +100,9 @@ void simple_blas_arm64_pack_B_8xK(int K, const float *B, int ldb, float *buffer)
 #define SIMPLE_BLAS_ARM64_TILE_N 8
 
 // Cache blocking parameters (tuned for Apple Silicon / ARM64)
-#define MC 264
-#define KC 256
-#define NC 512
+#define MC 192
+#define KC 192
+#define NC 384
 
 static void pack_A(int M, int K, const float *A, int lda, float *buffer) {
     int i = 0;
@@ -235,6 +235,22 @@ static void arm64_row_major_sgemm(int M,
 #define MT_THRESHOLD_M 256
 #define MAX_THREADS 16
 
+static int simple_blas_thread_cap(void) {
+    long nprocs = sysconf(_SC_NPROCESSORS_ONLN);
+    if (nprocs < 1) nprocs = 1;
+    if (nprocs > MAX_THREADS) nprocs = MAX_THREADS;
+    const char *env = getenv("SIMPLE_SGEMM_THREADS");
+    if (env && *env) {
+        char *end = NULL;
+        long override = strtol(env, &end, 10);
+        if (end != env && override > 0) {
+            if (override > MAX_THREADS) override = MAX_THREADS;
+            nprocs = override;
+        }
+    }
+    return (int)nprocs;
+}
+
 typedef struct {
     int M, N, K;
     float alpha, beta;
@@ -251,9 +267,7 @@ static void *gemm_thread_worker(void *arg) {
 
 static bool arm64_try_fast_path(bool rm, bool ta, bool tb, int M, int N, int K, float alpha, const float *A, int lda, const float *B, int ldb, float beta, float *C, int ldc) {
     if (!rm || ta || tb) return false;
-    long nprocs = sysconf(_SC_NPROCESSORS_ONLN);
-    if (nprocs < 1) nprocs = 1; if (nprocs > MAX_THREADS) nprocs = MAX_THREADS;
-    int nt = (int)nprocs;
+    int nt = simple_blas_thread_cap();
     if (M < MT_THRESHOLD_M || nt <= 1) {
         arm64_row_major_sgemm(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
         return true;
