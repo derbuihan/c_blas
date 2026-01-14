@@ -156,37 +156,130 @@ static float *allocate_matrix(size_t elements) {
 
 typedef struct {
     const char *label;
-    const char *env_var;
-    const char *default_path;
+    const char *primary_env;
+    const char *secondary_env;
+    const char *const *default_paths;
+    size_t default_path_count;
     void *handle;
     sgemm_fn fn;
 } dyn_backend;
 
-static int load_backend(dyn_backend *backend) {
-    const char *path = backend->env_var ? getenv(backend->env_var) : NULL;
-    if (!path || path[0] == '\0') path = backend->default_path;
+#if defined(__APPLE__)
+static const char *const openblas_default_paths[] = {
+    "/opt/homebrew/opt/openblas/lib/libopenblas.dylib",
+    "/usr/local/opt/openblas/lib/libopenblas.dylib",
+    "/usr/local/lib/libopenblas.dylib",
+    "libopenblas.dylib"
+};
 
-    backend->handle = dlopen(path, RTLD_LAZY | RTLD_LOCAL);
-    if (!backend->handle) { backend->fn = NULL; return -1; }
-    backend->fn = (sgemm_fn)dlsym(backend->handle, "cblas_sgemm");
-    if (!backend->fn) { dlclose(backend->handle); backend->handle = NULL; return -1; }
-    return 0;
+static const char *const accelerate_default_paths[] = {
+    "/System/Library/Frameworks/Accelerate.framework/Accelerate"
+};
+#else
+static const char *const openblas_default_paths[] = {
+    "/usr/lib/aarch64-linux-gnu/libopenblas.so.0",
+    "/usr/lib/aarch64-linux-gnu/libopenblas.so",
+    "/usr/lib/x86_64-linux-gnu/libopenblas.so.0",
+    "/usr/lib/x86_64-linux-gnu/libopenblas.so",
+    "/usr/lib/libopenblas.so",
+    "/usr/lib64/libopenblas.so",
+    "libopenblas.so",
+    "libopenblas.so.0"
+};
+
+static const char *const blas_default_paths[] = {
+    "/usr/lib/aarch64-linux-gnu/libblas.so.3",
+    "/usr/lib/x86_64-linux-gnu/libblas.so.3",
+    "/usr/lib/libblas.so.3",
+    "libblas.so.3",
+    "libblas.so"
+};
+#endif
+
+static const char *get_env_override(const dyn_backend *backend) {
+    if (backend->primary_env) {
+        const char *value = getenv(backend->primary_env);
+        if (value && value[0]) return value;
+    }
+    if (backend->secondary_env) {
+        const char *value = getenv(backend->secondary_env);
+        if (value && value[0]) return value;
+    }
+    return NULL;
+}
+
+static int load_backend(dyn_backend *backend) {
+    const char *path = get_env_override(backend);
+    if (path && path[0]) {
+        backend->handle = dlopen(path, RTLD_LAZY | RTLD_LOCAL);
+        if (backend->handle) {
+            backend->fn = (sgemm_fn)dlsym(backend->handle, "cblas_sgemm");
+            if (backend->fn) return 0;
+            dlclose(backend->handle);
+            backend->handle = NULL;
+        }
+        backend->fn = NULL;
+        return -1;
+    }
+
+    for (size_t i = 0; i < backend->default_path_count; ++i) {
+        const char *candidate = backend->default_paths[i];
+        if (!candidate || !candidate[0]) continue;
+        backend->handle = dlopen(candidate, RTLD_LAZY | RTLD_LOCAL);
+        if (!backend->handle) continue;
+        backend->fn = (sgemm_fn)dlsym(backend->handle, "cblas_sgemm");
+        if (backend->fn) return 0;
+        dlclose(backend->handle);
+        backend->handle = NULL;
+    }
+
+    backend->fn = NULL;
+    return -1;
 }
 
 int main(void) {
     const unsigned int base_seed = 42;
     printf("SGEMM Benchmark (Target: 0.2s/sample, Beta=0.0, Median of 5)\n");
 
-    dyn_backend openblas = {"OpenBLAS", "OPENBLAS_DYLIB",
-                            "/opt/homebrew/opt/openblas/lib/libopenblas.dylib", NULL, NULL};
-    dyn_backend accelerate = {"Accelerate", "ACCELERATE_DYLIB",
-                              "/System/Library/Frameworks/Accelerate.framework/Accelerate", NULL, NULL};
+#if defined(__APPLE__)
+    dyn_backend openblas = {
+        .label = "OpenBLAS",
+        .primary_env = "OPENBLAS_DYLIB",
+        .secondary_env = "OPENBLAS_LIB",
+        .default_paths = openblas_default_paths,
+        .default_path_count = sizeof(openblas_default_paths) / sizeof(openblas_default_paths[0]),
+    };
+    dyn_backend accelerate = {
+        .label = "Accelerate",
+        .primary_env = "ACCELERATE_DYLIB",
+        .secondary_env = NULL,
+        .default_paths = accelerate_default_paths,
+        .default_path_count = sizeof(accelerate_default_paths) / sizeof(accelerate_default_paths[0]),
+    };
+    dyn_backend *backends[] = {&openblas, &accelerate};
+#else
+    dyn_backend openblas = {
+        .label = "OpenBLAS",
+        .primary_env = "OPENBLAS_DYLIB",
+        .secondary_env = "OPENBLAS_LIB",
+        .default_paths = openblas_default_paths,
+        .default_path_count = sizeof(openblas_default_paths) / sizeof(openblas_default_paths[0]),
+    };
+    dyn_backend generic_blas = {
+        .label = "BLAS",
+        .primary_env = "BLAS_LIB",
+        .secondary_env = NULL,
+        .default_paths = blas_default_paths,
+        .default_path_count = sizeof(blas_default_paths) / sizeof(blas_default_paths[0]),
+    };
+    dyn_backend *backends[] = {&openblas, &generic_blas};
+#endif
+    const size_t backend_count = sizeof(backends) / sizeof(backends[0]);
 
-    load_backend(&openblas);
-    load_backend(&accelerate);
-
-    print_backend_info("OpenBLAS", openblas.fn);
-    print_backend_info("Accelerate", accelerate.fn);
+    for (size_t i = 0; i < backend_count; ++i) {
+        load_backend(backends[i]);
+        print_backend_info(backends[i]->label, backends[i]->fn);
+    }
 
     static const int sizes[] = {128, 256, 512, 1024, 2048};
 
@@ -196,8 +289,9 @@ int main(void) {
 
         // 修正7: 各バックエンドに同じシードを渡して公平に
         benchmark_backend("simple", simple_cblas_sgemm, n, base_seed);
-        benchmark_backend("OpenBLAS", openblas.fn, n, base_seed);
-        benchmark_backend("Accelerate", accelerate.fn, n, base_seed);
+        for (size_t bi = 0; bi < backend_count; ++bi) {
+            benchmark_backend(backends[bi]->label, backends[bi]->fn, n, base_seed);
+        }
 
         // 検証用（別途実行）
         const size_t elems = (size_t)n * n;
@@ -213,8 +307,10 @@ int main(void) {
             memset(C_simple, 0, elems * sizeof(float));
             memset(C_ref, 0, elems * sizeof(float));
 
-            sgemm_fn ref_fn = accelerate.fn ? accelerate.fn
-                            : (openblas.fn ? openblas.fn : NULL);
+            sgemm_fn ref_fn = NULL;
+            for (size_t bi = 0; bi < backend_count; ++bi) {
+                if (backends[bi]->fn) { ref_fn = backends[bi]->fn; break; }
+            }
             if (ref_fn) {
                 simple_cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                                    n, n, n, 1.0f, A, n, B, n, 0.0f, C_simple, n);
@@ -227,8 +323,9 @@ int main(void) {
         free(A); free(B); free(C_simple); free(C_ref);
     }
 
-    if (openblas.handle) dlclose(openblas.handle);
-    if (accelerate.handle) dlclose(accelerate.handle);
+    for (size_t i = 0; i < backend_count; ++i) {
+        if (backends[i]->handle) dlclose(backends[i]->handle);
+    }
 
     return EXIT_SUCCESS;
 }
