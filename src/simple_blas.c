@@ -113,12 +113,26 @@ static void simple_blas_select_blocking(int M, int N, int K, int *mc, int *nc, i
     int nc_val = NC;
     int kc_val = KC;
 
-    (void)min_mn;
-
     if (min_mn <= 192) {
-        mc_val = 144;
-        nc_val = 288;
-        kc_val = 144;
+        mc_val = 128;
+        nc_val = 256;
+        kc_val = 128;
+    } else if (min_mn <= 384) {
+        mc_val = 176;
+        nc_val = 320;
+        kc_val = 160;
+    } else if (min_mn <= 768) {
+        mc_val = 208;
+        nc_val = 384;
+        kc_val = 192;
+    } else if (min_mn <= 1536) {
+        mc_val = 256;
+        nc_val = 512;
+        kc_val = 224;
+    } else {
+        mc_val = 320;
+        nc_val = 512;
+        kc_val = 256;
     }
 
     if (mc_val > M) mc_val = M;

@@ -26,4 +26,6 @@ jobs:
       - name: Run benchmark suite
         env:
           SIMPLE_SGEMM_THREADS: 2
+          OPENBLAS_NUM_THREADS: 2
+          OMP_NUM_THREADS: 2
         run: make run
