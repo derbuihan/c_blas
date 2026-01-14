@@ -1,4 +1,4 @@
-name: C/C++ CI
+name: simple-blas-ci
 
 on:
   push:
@@ -7,17 +7,15 @@ on:
     branches: [ "main" ]
 
 jobs:
-  build:
-
-    runs-on: ubuntu-latest
-
+  bench:
+    runs-on: macos-14
     steps:
-    - uses: actions/checkout@v4
-    - name: configure
-      run: ./configure
-    - name: make
-      run: make
-    - name: make check
-      run: make check
-    - name: make distcheck
-      run: make distcheck
+      - uses: actions/checkout@v4
+
+      - name: Build bench binary
+        run: make bench
+
+      - name: Run benchmark suite
+        env:
+          SIMPLE_SGEMM_THREADS: 6
+        run: make run
