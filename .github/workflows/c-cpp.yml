@@ -25,5 +25,5 @@ jobs:
 
       - name: Run benchmark suite
         env:
-          SIMPLE_SGEMM_THREADS: 6
+          SIMPLE_SGEMM_THREADS: 2
         run: make run
