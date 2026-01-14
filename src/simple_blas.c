@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
 
 static inline size_t row_major_index(int row, int col, int ld) {
     return (size_t)row * (size_t)ld + (size_t)col;
@@ -230,23 +231,7 @@ static void arm64_compute_block(int row_start,
                 int me = (rows - ir > SIMPLE_BLAS_ARM64_TILE_M) ? SIMPLE_BLAS_ARM64_TILE_M : rows - ir;
                 int ne = (cols - jr > SIMPLE_BLAS_ARM64_TILE_N) ? SIMPLE_BLAS_ARM64_TILE_N : cols - jr;
                 float tail_block[SIMPLE_BLAS_ARM64_TILE_M * SIMPLE_BLAS_ARM64_TILE_N];
-                for (int tr = 0; tr < SIMPLE_BLAS_ARM64_TILE_M; ++tr) {
-                    float *dst_row = tail_block + tr * SIMPLE_BLAS_ARM64_TILE_N;
-                    if (tr < me) {
-                        const float *src_row = C + (size_t)(row_start + ir + tr) * ldc + (col_start + jr);
-                        for (int tc = 0; tc < SIMPLE_BLAS_ARM64_TILE_N; ++tc) {
-                            if (tc < ne) {
-                                dst_row[tc] = src_row[tc];
-                            } else {
-                                dst_row[tc] = 0.0f;
-                            }
-                        }
-                    } else {
-                        for (int tc = 0; tc < SIMPLE_BLAS_ARM64_TILE_N; ++tc) {
-                            dst_row[tc] = 0.0f;
-                        }
-                    }
-                }
+                memset(tail_block, 0, sizeof(tail_block));
                 simple_blas_arm64_kernel_12x8(packed_A + (size_t)ir * pb,
                                               packed_B + (size_t)jr * pb,
                                               tail_block,
@@ -255,12 +240,22 @@ static void arm64_compute_block(int row_start,
                                               SIMPLE_BLAS_ARM64_TILE_N,
                                               pb,
                                               alpha,
-                                              beta);
+                                              0.0f);
                 for (int tr = 0; tr < me; ++tr) {
                     float *dst_row = C + (size_t)(row_start + ir + tr) * ldc + (col_start + jr);
                     const float *src_row = tail_block + tr * SIMPLE_BLAS_ARM64_TILE_N;
-                    for (int tc = 0; tc < ne; ++tc) {
-                        dst_row[tc] = src_row[tc];
+                    if (beta == 0.0f) {
+                        if (ne > 0) {
+                            memcpy(dst_row, src_row, (size_t)ne * sizeof(float));
+                        }
+                    } else if (beta == 1.0f) {
+                        for (int tc = 0; tc < ne; ++tc) {
+                            dst_row[tc] += src_row[tc];
+                        }
+                    } else {
+                        for (int tc = 0; tc < ne; ++tc) {
+                            dst_row[tc] = src_row[tc] + beta * dst_row[tc];
+                        }
                     }
                 }
             }
@@ -371,20 +366,6 @@ static void *arm64_sgemm_block_worker(void *arg) {
     return NULL;
 }
 
-typedef struct {
-    int M, N, K;
-    float alpha, beta;
-    const float *A, *B;
-    int lda, ldb, ldc;
-    float *C;
-} ThreadArgs;
-
-static void *gemm_thread_worker(void *arg) {
-    ThreadArgs *a = (ThreadArgs *)arg;
-    arm64_row_major_sgemm(a->M, a->N, a->K, a->alpha, a->A, a->lda, a->B, a->ldb, a->beta, a->C, a->ldc);
-    return NULL;
-}
-
 static void arm64_row_major_sgemm_threaded(int M,
                                            int N,
                                            int K,
@@ -409,34 +390,43 @@ static void arm64_row_major_sgemm_threaded(int M,
 
     size_t size_A = (size_t)mc_storage * (size_t)kc * sizeof(float);
     size_t size_B = (size_t)kc * (size_t)nc_storage * sizeof(float);
-    float *packed_B = malloc(size_B);
+    float *packed_B_buffers[2] = {malloc(size_B), malloc(size_B)};
     float *packed_A_buffers[MAX_THREADS] = {0};
-    if (!packed_B) {
+    if (!packed_B_buffers[0] || !packed_B_buffers[1]) {
+        free(packed_B_buffers[0]);
+        free(packed_B_buffers[1]);
         arm64_row_major_sgemm(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
         return;
     }
     int actual_threads = thread_count;
     if (actual_threads > MAX_THREADS) actual_threads = MAX_THREADS;
+    int blocks_total = (M + mc - 1) / mc;
+    if (blocks_total < 1) blocks_total = 1;
+    if (actual_threads > blocks_total) actual_threads = blocks_total;
+    if (actual_threads < 1) actual_threads = 1;
     for (int t = 0; t < actual_threads; ++t) {
         packed_A_buffers[t] = malloc(size_A);
         if (!packed_A_buffers[t]) {
             for (int i = 0; i < t; ++i) free(packed_A_buffers[i]);
-            free(packed_B);
+            free(packed_B_buffers[0]);
+            free(packed_B_buffers[1]);
             arm64_row_major_sgemm(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
             return;
         }
     }
 
+    pthread_t threads[MAX_THREADS];
+    Arm64ThreadArgs args[MAX_THREADS];
+    int active_threads = actual_threads;
+    if (blocks_total < active_threads) active_threads = blocks_total;
+
     for (int j = 0; j < N; j += nc) {
         int jb = (N - j > nc) ? nc : N - j;
-        for (int p = 0; p < K; p += kc) {
-            int pb = (K - p > kc) ? kc : K - p;
-            pack_B(pb, jb, B + (size_t)p * ldb + j, ldb, packed_B);
-            float current_beta = (p == 0) ? beta : 1.0f;
-            int blocks = (M + mc - 1) / mc;
-            int active_threads = actual_threads;
-            if (blocks < active_threads) active_threads = blocks;
-            if (active_threads <= 1) {
+        if (active_threads <= 1) {
+            for (int p = 0; p < K; p += kc) {
+                int pb = (K - p > kc) ? kc : K - p;
+                pack_B(pb, jb, B + (size_t)p * ldb + j, ldb, packed_B_buffers[0]);
+                float current_beta = (p == 0) ? beta : 1.0f;
                 for (int i = 0; i < M; i += mc) {
                     int ib = (M - i > mc) ? mc : M - i;
                     arm64_compute_block(i,
@@ -454,18 +444,30 @@ static void arm64_row_major_sgemm_threaded(int M,
                                         C,
                                         ldc,
                                         packed_A_buffers[0],
-                                        packed_B);
+                                        packed_B_buffers[0]);
                 }
-                continue;
             }
+            continue;
+        }
 
-            pthread_t threads[MAX_THREADS];
-            Arm64ThreadArgs args[MAX_THREADS];
+        int current_buf = 0;
+        int next_pb = 0;
+        for (int p = 0; p < K; p += kc) {
+            int pb;
+            if (p == 0) {
+                pb = (K - p > kc) ? kc : K - p;
+                pack_B(pb, jb, B + (size_t)p * ldb + j, ldb, packed_B_buffers[current_buf]);
+            } else {
+                current_buf ^= 1;
+                pb = next_pb;
+            }
+            float current_beta = (p == 0) ? beta : 1.0f;
+
             for (int t = 0; t < active_threads; ++t) {
                 args[t] = (Arm64ThreadArgs){
                     .thread_id = t,
                     .thread_count = active_threads,
-                    .blocks = blocks,
+                    .blocks = blocks_total,
                     .mc = mc,
                     .pb = pb,
                     .jb = jb,
@@ -481,14 +483,21 @@ static void arm64_row_major_sgemm_threaded(int M,
                     .ldb = ldb,
                     .ldc = ldc,
                     .packed_A = packed_A_buffers[t],
-                    .packed_B = packed_B,
+                    .packed_B = packed_B_buffers[current_buf],
                 };
             }
-            for (int t = 0; t < active_threads - 1; ++t) {
+            for (int t = 0; t < active_threads; ++t) {
                 pthread_create(&threads[t], NULL, arm64_sgemm_block_worker, &args[t]);
             }
-            arm64_sgemm_block_worker(&args[active_threads - 1]);
-            for (int t = 0; t < active_threads - 1; ++t) {
+
+            int next_p = p + kc;
+            if (next_p < K) {
+                int next_buf = current_buf ^ 1;
+                next_pb = (K - next_p > kc) ? kc : K - next_p;
+                pack_B(next_pb, jb, B + (size_t)next_p * ldb + j, ldb, packed_B_buffers[next_buf]);
+            }
+
+            for (int t = 0; t < active_threads; ++t) {
                 pthread_join(threads[t], NULL);
             }
         }
@@ -497,7 +506,8 @@ static void arm64_row_major_sgemm_threaded(int M,
     for (int t = 0; t < actual_threads; ++t) {
         free(packed_A_buffers[t]);
     }
-    free(packed_B);
+    free(packed_B_buffers[0]);
+    free(packed_B_buffers[1]);
 }
 
 static int simple_blas_thread_cap(void) {
@@ -521,20 +531,6 @@ static bool arm64_try_fast_path(bool rm, bool ta, bool tb, int M, int N, int K, 
     int nt = simple_blas_thread_cap();
     if (M < MT_THRESHOLD_M || nt <= 1) {
         arm64_row_major_sgemm(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
-        return true;
-    }
-    int min_dim = (M < N) ? M : N;
-    if (min_dim < 768 || min_dim >= 1536) {
-        pthread_t t[MAX_THREADS]; ThreadArgs args[MAX_THREADS];
-        if (nt > MAX_THREADS) nt = MAX_THREADS;
-        int rpt = M / nt, rem = M % nt, cur = 0;
-        for (int i = 0; i < nt; i++) {
-            int rows = rpt + (i < rem ? 1 : 0);
-            args[i] = (ThreadArgs){rows, N, K, alpha, beta, A + (size_t)cur * lda, B, lda, ldb, ldc, C + (size_t)cur * ldc};
-            pthread_create(&t[i], NULL, gemm_thread_worker, &args[i]);
-            cur += rows;
-        }
-        for (int i = 0; i < nt; i++) pthread_join(t[i], NULL);
         return true;
     }
     arm64_row_major_sgemm_threaded(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, nt);
